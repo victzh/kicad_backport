@@ -7,6 +7,7 @@
 
 import sys
 import os
+from time import time
 import sexpdata
 
 
@@ -78,6 +79,21 @@ class Property:
         weight = 'B' if self.effects.font_bold else 'N'
         text = self.text if print_text else ''
         return f'"{text}" {x} {y} {font_size} {direction} {visibility} {j_x} {j_y}{slant}{weight}'
+    def serialize_sch(self, x0, y0, matrix):
+        x = int(self.at[0]*1000/25.4)
+        y = int(self.at[1]*1000/25.4)
+        dx = x - x0
+        dy = y - y0
+        x = x0 + dx*matrix[0] + dy*matrix[1] 
+        y = y0 + dx*matrix[2] + dy*matrix[3] 
+        font_size = int(self.effects.font_size[0]*1000/25.4)
+        direction = 'H' if self.at[2] == 0 else 'V'
+        visibility = '0001' if self.effects.hide else '0000'
+        j_x = self.effects.justify_x[0].upper()
+        j_y = self.effects.justify_y[0].upper()
+        slant = 'I' if self.effects.font_italic else 'N'
+        weight = 'B' if self.effects.font_bold else 'N'
+        return f'"{self.text}" {direction} {x} {y} {font_size}  {visibility} {j_x} {j_y}{slant}{weight}'
 
 
 # Symbol drawing primitives
@@ -373,6 +389,14 @@ class Symbol:
         self.power = False
         self.aliases = []        # ALIAS
         self.units = []          # DRAW
+        # for symbol references in schematics
+        self.at = 0,0,0
+        self.mirror = ''
+        self.in_bom = False
+        self.on_board = False
+        self.uuid = ''
+        self.short_id = 0
+        self.unit = -1
         if body: self.parse(body)
     def parse(self, body):
         for entry in body:
@@ -423,6 +447,19 @@ class Symbol:
                             self.pin_names_offset = effect[1]
                     elif effect.value() == 'hide':
                         self.pin_names_hide = True
+            # for symbol references in schematics
+            elif e_type == 'at':
+                self.at = tuple(entry[1:])
+            elif e_type == 'in_bom':
+                self.in_bom = entry[1].value() == 'yes'
+            elif e_type == 'on_board':
+                self.on_board = entry[1].value() == 'yes'
+            elif e_type == 'uuid':
+                self.uuid = entry[1]
+            elif e_type == 'mirror':
+                self.mirror = entry[1].value()
+            elif e_type == 'unit':
+                self.unit = entry[1]
             else:
                 print(f'Unknown symbol entry: {e_type}')
 
@@ -496,6 +533,7 @@ class Symbol:
         lines.append('ENDDRAW')
         lines.append('ENDDEF')
         return '\n'.join(lines)
+
     def serialize_dcm(self):
         has_description = self.description and self.description.text
         has_keywords = self.keywords and self.keywords.text
@@ -512,6 +550,35 @@ class Symbol:
         if has_datasheet:
             lines.append(f'F {self.datasheet.text}')
         lines.append('$ENDCMP')
+        return '\n'.join(lines)
+
+    def serialize_sch(self):
+        lines = []
+        lines.append('$Comp')
+        lines.append(f'L {self.libname}:{self.name} {self.reference.text}')
+        lines.append(f'U {self.unit} 1 {hex(self.short_id)[2:].upper()}')
+        x = int(self.at[0]*1000/25.4)
+        y = int(self.at[1]*1000/25.4)
+        # matrix = [cos(a), -sin(a), -sin(a), -cos(a)]
+        angle = int((self.at[2]+45)/90)%4
+        matrix = [
+            [ 1,  0,  0, -1],
+            [ 0, -1, -1,  0],
+            [-1,  0,  0,  1],
+            [ 0,  1,  1,  0]
+        ][angle]
+        if self.mirror == 'y':
+            matrix = [matrix[0]*-1, matrix[1], matrix[2]*-1, matrix[3]]
+        elif self.mirror == 'x':
+            matrix = [matrix[0], matrix[1]*-1, matrix[2], matrix[3]*-1]
+        lines.append(f'P {x} {y}')
+        lines.append(f'F 0 {self.reference.serialize_sch(x, y, matrix)}') 
+        lines.append(f'F 1 {self.value.serialize_sch(x, y, matrix)}') 
+        lines.append(f'F 2 {self.footprint.serialize_sch(x, y, matrix)}') 
+        lines.append(f'F 3 {self.datasheet.serialize_sch(x, y, matrix)}')
+        lines.append(f'\t1    {x} {y}')
+        lines.append(f'\t{matrix[0]}    {matrix[1]}    {matrix[2]}    {matrix[3]}')
+        lines.append('$EndComp')
         return '\n'.join(lines)
 
 
@@ -565,24 +632,161 @@ EESchema-DOCLIB  Version 2.0
         return header + '\n'.join([x for x in entries if x]) + footer
 
 
-# TODO: Parse and serialize schematics    
+# Parse and serialize schematics
+class SchObject:
+    def __init__(self):
+        self.x = 0
+        self.y = 0
+    def parse_element(self, el):
+        e_type = el[0].value()
+        if e_type == 'at':
+            self.x = el[1]
+            self.y = el[2]
+
+
+class Junction(SchObject):
+    def __init__(self, body):
+        super().__init__()
+        for el in body:
+            e_type = el[0].value()
+            if e_type == 'diameter':
+                pass
+            elif e_type == 'color':
+                pass
+            else:
+                super().parse_element(el)
+
+    def serialize_sch(self):
+        x = int(self.x*1000/25.4)
+        y = int(self.y*1000/25.4)
+        return f'Connection ~ {x} {y}'
+
+
+class NoConnect(SchObject):
+    def __init__(self, body):
+        super().__init__()
+        for el in body:
+            super().parse_element(el)
+    def serialize_sch(self):
+        x = int(self.x*1000/25.4)
+        y = int(self.y*1000/25.4)
+        return f'NoConn ~ {x} {y}'
+
+
+class Wire(SchObject):
+    def __init__(self, body):
+        super().__init__()
+        self.x1 = 0
+        self.y1 = 0
+        for el in body:
+            e_type = el[0].value()
+            if e_type == 'stroke':
+                pass
+            elif e_type == 'pts':
+                self.x = el[1][1]
+                self.y = el[1][2]
+                self.x1 = el[2][1]
+                self.y1 = el[2][2]
+            else:
+                super().parse_element(el)
+    def serialize_sch(self):
+        x = int(self.x*1000/25.4)
+        y = int(self.y*1000/25.4)
+        x1 = int(self.x1*1000/25.4)
+        y1 = int(self.y1*1000/25.4)
+        return f'Wire Wire Line\n\t{x} {y} {x1} {y1}'
+
+
+class Label(SchObject):
+    def __init__(self, body):
+        super().__init__()
+        self.text = body[0]
+        self.angle = 0
+        self.effects = Effects()
+        for el in body[1:]:
+            e_type = el[0].value()
+            if e_type == 'at':
+                self.x = el[1]
+                self.y = el[2]
+                self.angle = el[3]
+            elif e_type == 'effects':
+                self.effects = Effects(el[1:])
+            else:
+                super().parse_element(el)
+    def serialize_sch(self):
+        x = int(self.x*1000/25.4)
+        y = int(self.y*1000/25.4)
+        angle = int((self.angle+45)/90)%4
+        font_size = int(self.effects.font_size[0]*1000/25.4)
+        slant = 'Italic' if self.effects.font_italic else '~'
+        weight = '10' if self.effects.font_bold else '0'
+        return f'Text Label {x} {y} {angle}    {font_size}   {slant} {weight}\n{self.text}'
+
+
 class Schematics:
     def __init__(self):
-        pass
+        self.junctions = []
+        self.no_connects = []
+        self.wires = []
+        self.labels = []
+        self.symbols = []
+        self.short_id = int(time())
     def parse_entry(self, entry):
         e_type = entry[0].value()
+        body = entry[1:]
         if e_type == 'junction':
-            pass
+            self.junctions.append(Junction(body))
         elif e_type == 'no_connect':
-            pass
+            self.no_connects.append(NoConnect(body))
         elif e_type == 'wire':
-            pass
+            self.wires.append(Wire(body))
         elif e_type == 'label':
-            pass
+            self.labels.append(Label(body))
         elif e_type == 'symbol':
-            pass
+            lib_id = entry[1]
+            if lib_id[0].value() != 'lib_id':
+                # can'r parse this
+                sys.stderr.write(f'Incorrect symbol start {lib_id[0]}\n')
+                return
+            libname = ''
+            parts = lib_id[1].split(':')
+            if len(parts) > 1:
+                libname = parts[0]
+                name = parts[1]
+            else:
+                name = e_name
+            sym = Symbol(libname, name, entry[2:])
+            sym.short_id = self.short_id
+            self.short_id += 1
+            self.symbols.append(sym)
         elif e_type == 'path':
             pass
+    def serialize_sch(self):
+        header = '''\
+EESchema Schematic File Version 4
+EELAYER 30 0
+EELAYER END
+$Descr A4 11693 8268
+encoding utf-8
+Sheet 1 1
+Title ""
+Date ""
+Rev ""
+Comp ""
+Comment1 ""
+Comment2 ""
+Comment3 ""
+Comment4 ""
+$EndDescr
+'''
+        footer = '\n$EndSCHEMATC\n'
+        lines = []
+        lines += [obj.serialize_sch() for obj in self.junctions]
+        lines += [obj.serialize_sch() for obj in self.no_connects]
+        lines += [obj.serialize_sch() for obj in self.wires]
+        lines += [obj.serialize_sch() for obj in self.labels]
+        lines += [obj.serialize_sch() for obj in self.symbols]
+        return header + '\n'.join(lines) + footer
 
 
 def main():
@@ -593,7 +797,8 @@ def main():
     with open(fn, "rt") as f:
         text = f.read()
     sexpr = sexpdata.loads(text)
-    cache_lib = False
+    is_schematics = False
+    schematics = None
     if sexpr[0] == sexpdata.Symbol('kicad_symbol_lib'):
         # KiCad symbol library new format 
         # First element - symbol kicad_symbol_lib
@@ -604,26 +809,30 @@ def main():
         body = sexpr[1:]
     elif sexpr[0] == sexpdata.Symbol('kicad_sch'):
         # KiCad schematics new format
-        cache_lib = True
-        sch = Schematics()
+        is_schematics = True
+        schematics = Schematics()
         for entry in sexpr[1:]:
             e_type = entry[0].value()
             if e_type == 'lib_symbols':
                 body = entry[1:]
             else:
-                sch.parse_entry(entry)
+                schematics.parse_entry(entry)
     else:
         print("Invalid symbol lib")
         return 2
     library = Library(body)
     fn_base, _ = os.path.splitext(fn)
-    if cache_lib:
+    if is_schematics:
         fn_lib = fn_base + '-cache.lib'
     else:
         fn_lib = fn_base + '.lib'
     with open(fn_lib, "wt") as f:
-        f.write(library.serialize_lib(cache_lib))
-    if not cache_lib:
+        f.write(library.serialize_lib(is_schematics))
+    if is_schematics:
+        fn_sch = fn_base + '.sch'
+        with open(fn_sch, "wt") as f:
+            f.write(schematics.serialize_sch())
+    if not is_schematics:
         fn_dcm = fn_base + '.dcm'
         with open(fn_dcm, "wt") as f:
             f.write(library.serialize_dcm())
